@@ -1,7 +1,5 @@
-"""CV Studio Auth Backend — login + admin approval for the CV Studio desktop app.
-
-Deploy: Render free web service (see README).
-Admin: set ADMIN_KEY env var on Render; open /admin and enter the key.
+"""CV Studio auth backend — FastAPI + SQLite. Run: uvicorn main:app --host 0.0.0.0 --port $PORT
+Env: ADMIN_KEY (required for /admin). Data dir: ./data/app.db
 """
 import hashlib
 import hmac
@@ -11,16 +9,17 @@ import sqlite3
 import time
 from pathlib import Path
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel
-
-BASE = Path(__file__).parent
-DATA_DIR = BASE / "data"
-DATA_DIR.mkdir(exist_ok=True)
-DB = DATA_DIR / "app.db"
+from pydantic import BaseModel, EmailStr, Field
 
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
+DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB = DATA_DIR / "app.db"
+BUILD = "2026-10-11d"
+
+app = FastAPI(title="CV Studio Auth")
 
 
 def db():
@@ -30,245 +29,300 @@ def db():
 
 
 def init_db():
-    with db() as c:
-        c.execute(
-            """CREATE TABLE IF NOT EXISTS users(
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 name TEXT NOT NULL,
-                 email TEXT UNIQUE NOT NULL,
-                 pw_hash TEXT NOT NULL,
-                 salt TEXT NOT NULL,
-                 status TEXT NOT NULL DEFAULT 'pending',
-                 created_at REAL NOT NULL)"""
-        )
-        c.execute(
-            """CREATE TABLE IF NOT EXISTS tokens(
-                 token_hash TEXT PRIMARY KEY,
-                 user_id INTEGER NOT NULL,
-                 created_at REAL NOT NULL)"""
-        )
+    c = db()
+    c.execute("""CREATE TABLE IF NOT EXISTS users(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL, email TEXT UNIQUE NOT NULL,
+        pw_hash TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+        created_at REAL NOT NULL)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS tokens(
+        token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL,
+        created_at REAL NOT NULL)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS attempts(
+        ip TEXT PRIMARY KEY, fails INTEGER NOT NULL, window_start REAL NOT NULL)""")
+    c.commit()
+    c.close()
 
 
 init_db()
 
-app = FastAPI(title="CV Studio Auth")
 
-
-# ---------- helpers ----------
-def hash_pw(password: str, salt: str) -> str:
-    return hashlib.pbkdf2_hmac(
-        "sha256", password.encode(), salt.encode(), 200_000
-    ).hex()
-
-
-def check_admin(key: str):
-    if not ADMIN_KEY or not key or not hmac.compare_digest(key, ADMIN_KEY):
-        raise HTTPException(status_code=403, detail="Admin key required")
-
-
-def get_user_by_token(token: str):
-    th = hashlib.sha256(token.encode()).hexdigest()
-    with db() as c:
-        row = c.execute(
-            "SELECT u.* FROM tokens t JOIN users u ON u.id=t.user_id "
-            "WHERE t.token_hash=?",
-            (th,),
-        ).fetchone()
-    return row
-
-
-# simple in-memory login throttle: 10 attempts / 5 min per IP
-_attempts: dict = {}
-
-
-def throttled(ip: str) -> bool:
-    now = time.time()
-    lst = [t for t in _attempts.get(ip, []) if now - t < 300]
-    _attempts[ip] = lst
-    return len(lst) >= 10
-
-
-def note_attempt(ip: str):
-    _attempts.setdefault(ip, []).append(time.time())
-
-
-# ---------- models ----------
-class RegisterIn(BaseModel):
-    name: str
-    email: str
-    password: str
-
-
-class LoginIn(BaseModel):
-    email: str
-    password: str
-
-
-# ---------- public API ----------
-@app.post("/api/register")
-def register(body: RegisterIn):
-    name = body.name.strip()[:80]
-    email = body.email.strip().lower()[:120]
-    if not name or "@" not in email or len(body.password) < 6:
-        raise HTTPException(
-            status_code=400,
-            detail="Give your name, a valid email and a 6+ character password.",
-        )
+def hash_pw(pw: str) -> str:
     salt = secrets.token_hex(16)
+    h = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 200_000).hex()
+    return f"{salt}${h}"
+
+
+def check_pw(pw: str, stored: str) -> bool:
     try:
-        with db() as c:
-            c.execute(
-                "INSERT INTO users(name,email,pw_hash,salt,status,created_at)"
-                " VALUES(?,?,?,?, 'pending', ?)",
-                (name, email, hash_pw(body.password, salt), salt,
-                 time.time()),
-            )
-    except sqlite3.IntegrityError:
-        raise HTTPException(
-            status_code=400, detail="This email is already registered."
-        )
-    return {"ok": True,
-            "message": "Request received. The admin will approve your account."}
+        salt, h = stored.split("$")
+    except ValueError:
+        return False
+    calc = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 200_000).hex()
+    return hmac.compare_digest(calc, h)
 
 
-@app.post("/api/login")
-def login(body: LoginIn, request: Request):
-    ip = request.client.host if request.client else "?"
-    if throttled(ip):
-        raise HTTPException(status_code=429,
-                            detail="Too many attempts. Wait a few minutes.")
-    email = body.email.strip().lower()
-    with db() as c:
-        row = c.execute("SELECT * FROM users WHERE email=?",
-                        (email,)).fetchone()
-    if not row or not hmac.compare_digest(
-            row["pw_hash"], hash_pw(body.password, row["salt"])):
-        note_attempt(ip)
-        raise HTTPException(status_code=401,
-                            detail="Wrong email or password.")
-    if row["status"] == "pending":
-        raise HTTPException(
-            status_code=403,
-            detail="Your account is waiting for admin approval.")
-    if row["status"] == "disabled":
-        raise HTTPException(status_code=403,
-                            detail="This account has been disabled.")
-    token = secrets.token_urlsafe(32)
-    th = hashlib.sha256(token.encode()).hexdigest()
-    with db() as c:
-        c.execute("INSERT INTO tokens(token_hash,user_id,created_at)"
-                  " VALUES(?,?,?)", (th, row["id"], time.time()))
-    return {"token": token, "name": row["name"], "email": row["email"]}
+def need_admin(x_admin_key: str = Header(default="")):
+    if not ADMIN_KEY or x_admin_key != ADMIN_KEY:
+        raise HTTPException(403, "Admin key required")
+    return True
 
 
-@app.get("/api/me")
-def me(authorization: str = Header(default="")):
-    token = authorization.replace("Bearer ", "").strip()
-    row = get_user_by_token(token) if token else None
-    if not row or row["status"] != "approved":
-        raise HTTPException(status_code=401, detail="Not logged in")
-    return {"name": row["name"], "email": row["email"]}
+def client_ip(req: Request) -> str:
+    fwd = req.headers.get("x-forwarded-for")
+    return fwd.split(",")[0].strip() if fwd else (req.client.host if req.client else "?")
+
+
+
+def throttle_ok(ip: str) -> bool:
+    now = time.time()
+    c = db()
+    row = c.execute("SELECT fails, window_start FROM attempts WHERE ip=?", (ip,)).fetchone()
+    if row and now - row["window_start"] < 300 and row["fails"] >= 10:
+        c.close()
+        return False
+    c.close()
+    return True
+
+
+def throttle_hit(ip: str):
+    now = time.time()
+    c = db()
+    row = c.execute("SELECT fails, window_start FROM attempts WHERE ip=?", (ip,)).fetchone()
+    if row and now - row["window_start"] < 300:
+        c.execute("UPDATE attempts SET fails=fails+1 WHERE ip=?", (ip,))
+    else:
+        c.execute("REPLACE INTO attempts(ip,fails,window_start) VALUES(?,?,?)",
+                  (ip, 1, now))
+    c.commit()
+    c.close()
+
+
+def throttle_clear(ip: str):
+    c = db()
+    c.execute("DELETE FROM attempts WHERE ip=?", (ip,))
+    c.commit()
+    c.close()
+
+
+class Register(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    email: EmailStr
+    password: str = Field(min_length=8, max_length=128)
+
+
+class Login(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=1, max_length=128)
 
 
 @app.get("/api/health")
 def health():
+    return {"ok": True, "build": BUILD}
+
+
+@app.post("/api/register")
+def register(r: Register):
+    c = db()
+    exists = c.execute("SELECT id FROM users WHERE email=?",
+                       (r.email.lower(),)).fetchone()
+    if exists:
+        c.close()
+        raise HTTPException(400, "This email is already registered.")
+    c.execute("INSERT INTO users(name,email,pw_hash,status,created_at) VALUES(?,?,?,?,?)",
+              (r.name.strip(), r.email.lower(), hash_pw(r.password),
+               "pending", time.time()))
+    c.commit()
+    c.close()
+    return {"ok": True,
+            "message": "Request received. The admin will approve your account, then you can sign in."}
+
+
+@app.post("/api/login")
+def login(r: Login, request: Request):
+    ip = client_ip(request)
+    if not throttle_ok(ip):
+        raise HTTPException(429, "Too many attempts. Try again in a few minutes.")
+    c = db()
+    u = c.execute("SELECT * FROM users WHERE email=?", (r.email.lower(),)).fetchone()
+    if not u or not check_pw(r.password, u["pw_hash"]):
+        c.close()
+        throttle_hit(ip)
+        raise HTTPException(401, "Email or password is wrong.")
+    if u["status"] == "pending":
+        c.close()
+        raise HTTPException(403, "Your account is waiting for admin approval.")
+    if u["status"] != "approved":
+        c.close()
+        raise HTTPException(403, "This account has been disabled.")
+    throttle_clear(ip)
+    token = secrets.token_urlsafe(32)
+    th = hashlib.sha256(token.encode()).hexdigest()
+    c.execute("INSERT INTO tokens(token_hash,user_id,created_at) VALUES(?,?,?)",
+              (th, u["id"], time.time()))
+    c.commit()
+    c.close()
+    return {"ok": True, "token": token, "name": u["name"]}
+
+
+def user_from_token(auth: str):
+    if not auth or not auth.startswith("Bearer "):
+        return None
+    th = hashlib.sha256(auth[7:].encode()).hexdigest()
+    c = db()
+    t = c.execute("SELECT user_id FROM tokens WHERE token_hash=?", (th,)).fetchone()
+    if not t:
+        c.close()
+        return None
+    u = c.execute("SELECT id,name,email,status FROM users WHERE id=?",
+                  (t["user_id"],)).fetchone()
+    c.close()
+    if not u or u["status"] != "approved":
+        return None
+    return u
+
+
+@app.get("/api/me")
+def me(request: Request):
+    u = user_from_token(request.headers.get("authorization", ""))
+    if not u:
+        raise HTTPException(401, "Not signed in.")
+    return {"ok": True, "name": u["name"], "email": u["email"]}
+
+
+@app.get("/admin/api/users")
+def admin_list(f: str = "pending", ok: bool = Depends(need_admin)):
+    q = "SELECT id,name,email,status,created_at FROM users"
+    if f in ("pending", "approved", "disabled"):
+        q += " WHERE status=? ORDER BY created_at DESC"
+        args = (f,)
+    else:
+        q += " ORDER BY created_at DESC"
+        args = ()
+    c = db()
+    rows = [dict(r) for r in c.execute(q, args).fetchall()]
+    c.close()
+    return {"users": rows}
+
+
+@app.post("/admin/api/users/{uid}/approve")
+def admin_approve(uid: int, ok: bool = Depends(need_admin)):
+    c = db()
+    c.execute("UPDATE users SET status='approved' WHERE id=?", (uid,))
+    c.commit()
+    c.close()
     return {"ok": True}
 
 
-@app.get("/", response_class=HTMLResponse)
-def index():
-    return """<!DOCTYPE html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CV Studio Auth</title>
-<style>body{font-family:-apple-system,'Segoe UI',sans-serif;background:#101216;
-color:#e8eaed;max-width:640px;margin:0 auto;padding:40px 20px}
-.card{background:#1a1d22;border:1px solid #2c3138;border-radius:12px;padding:24px}
-h1{font-size:20px;margin-bottom:8px}p{font-size:14px;color:#9aa0a6;line-height:1.7}
-a{color:#8ab4f8}</style></head><body>
-<div class="card"><h1>CV Studio — login server</h1>
-<p>This server handles sign-in and account approvals for the CV Studio app.</p>
-<p>• <a href="/admin">Admin approval page</a> (needs your ADMIN_KEY)<br>
-• App users sign in inside CV Studio, not here.</p>
-<p>Status: running ✓</p></div></body></html>"""
+@app.post("/admin/api/users/{uid}/reject")
+def admin_reject(uid: int, ok: bool = Depends(need_admin)):
+    c = db()
+    c.execute("DELETE FROM users WHERE id=? AND status='pending'", (uid,))
+    c.commit()
+    c.close()
+    return {"ok": True}
 
 
-# ---------- admin ----------
-ADMIN_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8">
+@app.post("/admin/api/users/{uid}/disable")
+def admin_disable(uid: int, ok: bool = Depends(need_admin)):
+    c = db()
+    c.execute("UPDATE users SET status='disabled' WHERE id=?", (uid,))
+    c.execute("DELETE FROM tokens WHERE user_id=?", (uid,))
+    c.commit()
+    c.close()
+    return {"ok": True}
+
+
+ADMIN_HTML = """<!DOCTYPE html>
+<html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CV Studio — Admin</title>
+<title>CV Studio - Admin</title>
 <style>
 body{font-family:-apple-system,'Segoe UI',sans-serif;background:#101216;color:#e8eaed;
-max-width:760px;margin:0 auto;padding:24px}
-.card{background:#1a1d22;border:1px solid #2c3138;border-radius:12px;padding:18px;margin-bottom:14px}
-h1{font-size:20px}h2{font-size:15px;margin-bottom:10px}
-button{background:#2f7cf6;color:#fff;border:none;border-radius:8px;padding:8px 14px;
-font-size:13px;cursor:pointer;font-weight:600;margin-right:8px}
-button.red{background:#a33}button.gray{background:#33373d}
-input{background:#262b32;color:#e8eaed;border:1px solid #3d434c;border-radius:8px;
-padding:10px 12px;font-size:14px;width:100%;box-sizing:border-box}
-table{width:100%;border-collapse:collapse;font-size:14px}
+ max-width:760px;margin:0 auto;padding:32px 16px}
+.card{background:#1a1d22;border:1px solid #2c3138;border-radius:12px;padding:24px}
+input{width:100%;box-sizing:border-box;background:#0f1114;border:1px solid #2c3138;
+ color:#e8eaed;border-radius:8px;padding:10px;font-size:15px}
+button{background:#1a73e8;color:#fff;border:0;border-radius:8px;padding:9px 18px;
+ font-size:14px;cursor:pointer;margin:2px 4px 2px 0}
+button.red{background:#5f2120}
+table{width:100%;border-collapse:collapse;font-size:14px;margin-top:12px}
 td,th{padding:8px;border-bottom:1px solid #2c3138;text-align:left}
 .st-pending{color:#fbbc04}.st-approved{color:#81c995}.st-disabled{color:#f28b82}
-.tabs button{margin-bottom:12px}
-#login{display:block}#panel{display:none}
+#keymsg{color:#f28b82;font-size:13px;margin-top:8px;min-height:18px}
+.build{color:#5f6368;font-size:11px;margin-top:14px}
+.filters{margin:14px 0 4px}
 </style></head><body>
-<h1>CV Studio — Admin</h1>
-<div class="card" id="login">
+<div id="login" class="card">
   <h2>Enter admin key</h2>
   <input type="password" id="key" placeholder="ADMIN_KEY from Render dashboard"
          onkeydown="if(event.key==='Enter')go()">
   <div style="margin-top:10px"><button onclick="go()">Open</button></div>
-  <div id="keymsg" style="color:#f28b82;font-size:13px;margin-top:8px"></div>
-  <div style="color:#5f6368;font-size:11px;margin-top:14px">build 2026-10-11c — if you don't see this line, the new file hasn't deployed yet</div>
+  <div id="keymsg"></div>
+  <div class="build">build __BUILD__ - if you do not see this line, the new file has not deployed yet</div>
 </div>
-<div id="panel">
-  <div class="card"><div class="tabs">
+<div id="panel" class="card" style="display:none">
+  <h2>Account approvals</h2>
+  <div class="filters">
     <button onclick="load('pending')">Pending</button>
     <button onclick="load('approved')">Approved</button>
     <button onclick="load('all')">All</button>
-  </div><div id="list"></div></div>
+  </div>
+  <div id="list"><p>Loading...</p></div>
 </div>
 <script>
-let KEY='';
+var KEY='';
 async function api(p,opt){
-  const r=await fetch(p,{...opt,headers:{'X-Admin-Key':KEY,...(opt&&opt.headers||{})}});
-  const d=await r.json();
-  if(!r.ok) throw new Error(d.detail||('Error '+r.status));
+  opt=opt||{};
+  var h={'X-Admin-Key':KEY};
+  if(opt.headers){for(var k in opt.headers){h[k]=opt.headers[k];}}
+  var r=await fetch(p,{method:opt.method||'GET',headers:h});
+  var d=await r.json();
+  if(!r.ok){throw new Error(d.detail||('Error '+r.status));}
   return d;
 }
 async function go(){
   KEY=document.getElementById('key').value;
-  document.getElementById('keymsg').textContent='';
-  if(!KEY){document.getElementById('keymsg').textContent='Type the admin key first.';return;}
+  var msg=document.getElementById('keymsg');
+  msg.textContent='';
+  if(!KEY){msg.textContent='Type the admin key first.';return;}
   try{
     await api('/admin/api/users?f=pending');
     document.getElementById('login').style.display='none';
     document.getElementById('panel').style.display='block';
     load('pending');
   }catch(e){
-    document.getElementById('keymsg').textContent=e.message+
-      ' — check the ADMIN_KEY value in your Render dashboard (Environment tab).';
+    msg.textContent=e.message+' - check the ADMIN_KEY value in your Render dashboard (Environment tab).';
   }
 }
 async function load(f){
+  var box=document.getElementById('list');
   try{
-    const d=await api('/admin/api/users?f='+f);
-    document.getElementById('list').innerHTML='<table><tr><th>Name</th><th>Email</th>'+
-    '<th>Status</th><th></th></tr>'+d.users.map(u=>'<tr><td>'+u.name+'</td><td>'+u.email+
-    '</td><td class="st-'+u.status+'">'+u.status+'</td><td>'+
-    (u.status==='pending'?'<button onclick="act('+u.id+',\'approve\')">Approve</button>'+
-    '<button class="red" onclick="act('+u.id+',\'reject\')">Reject</button>':'')+
-    (u.status==='approved'?'<button class="red" onclick="act('+u.id+',\'disable\')">Disable</button>':'')+
-    '</td></tr>').join('')+'</table>';
+    var d=await api('/admin/api/users?f='+f);
+    var rows=d.users.map(function(u){
+      var btns='';
+      if(u.status==='pending'){
+        btns=`<button onclick="act(${u.id},'approve')">Approve</button>`+
+             `<button class="red" onclick="act(${u.id},'reject')">Reject</button>`;
+      }else if(u.status==='approved'){
+        btns=`<button class="red" onclick="act(${u.id},'disable')">Disable</button>`;
+      }
+      return `<tr><td>${u.name}</td><td>${u.email}</td>`+
+             `<td class="st-${u.status}">${u.status}</td><td>${btns}</td></tr>`;
+    }).join('');
+    box.innerHTML='<table><tr><th>Name</th><th>Email</th><th>Status</th><th></th></tr>'+
+                  rows+'</table>';
   }catch(e){
-    document.getElementById('list').innerHTML='<p style="color:#f28b82">'+e.message+'</p>';
+    box.innerHTML='<p style="color:#f28b82">'+e.message+'</p>';
   }
 }
 async function act(id,a){
-  try{ await api('/admin/api/users/'+id+'/'+a,{method:'POST'});load('pending'); }
-  catch(e){ alert(e.message); }
+  try{await api('/admin/api/users/'+id+'/'+a,{method:'POST'});load('pending');}
+  catch(e){alert(e.message);}
 }
-</script></body></html>"""
+</script>
+</body></html>
+""".replace("__BUILD__", BUILD)
 
 
 @app.get("/admin", response_class=HTMLResponse)
@@ -276,37 +330,24 @@ def admin_page():
     return ADMIN_HTML
 
 
-@app.get("/admin/api/users")
-def admin_users(f: str = "pending", x_admin_key: str = Header(default="")):
-    check_admin(x_admin_key)
-    q = "SELECT id,name,email,status,created_at FROM users"
-    if f == "pending":
-        q += " WHERE status='pending'"
-    elif f == "approved":
-        q += " WHERE status='approved'"
-    q += " ORDER BY created_at DESC"
-    with db() as c:
-        rows = c.execute(q).fetchall()
-    return {"users": [dict(r) for r in rows]}
-
-
-@app.post("/admin/api/users/{uid}/{action}")
-def admin_action(uid: int, action: str,
-                 x_admin_key: str = Header(default="")):
-    check_admin(x_admin_key)
-    mapping = {"approve": "approved", "reject": "disabled",
-               "disable": "disabled"}
-    if action not in mapping:
-        raise HTTPException(status_code=400, detail="bad action")
-    with db() as c:
-        c.execute("UPDATE users SET status=? WHERE id=?",
-                  (mapping[action], uid))
-        if mapping[action] == "disabled":
-            c.execute("DELETE FROM tokens WHERE user_id=?", (uid,))
-    return {"ok": True}
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0",
-                port=int(os.environ.get("PORT", 8000)))
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return """<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CV Studio Auth</title>
+<style>
+body{font-family:-apple-system,'Segoe UI',sans-serif;background:#101216;color:#e8eaed;
+ max-width:640px;margin:0 auto;padding:40px 20px}
+.card{background:#1a1d22;border:1px solid #2c3138;border-radius:12px;padding:24px}
+h1{font-size:20px;margin-bottom:8px}
+p{font-size:14px;color:#9aa0a6;line-height:1.7}
+a{color:#8ab4f8}
+</style></head><body>
+<div class="card"><h1>CV Studio - login server</h1>
+<p>This server handles sign-in and account approvals for the CV Studio app.</p>
+<p><a href="/admin">Admin approval page</a> (needs your ADMIN_KEY)<br>
+App users sign in inside CV Studio, not here.</p>
+<p>Status: running</p></div>
+</body></html>
+"""
