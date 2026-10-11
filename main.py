@@ -175,6 +175,23 @@ def health():
     return {"ok": True}
 
 
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return """<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CV Studio Auth</title>
+<style>body{font-family:-apple-system,'Segoe UI',sans-serif;background:#101216;
+color:#e8eaed;max-width:640px;margin:0 auto;padding:40px 20px}
+.card{background:#1a1d22;border:1px solid #2c3138;border-radius:12px;padding:24px}
+h1{font-size:20px;margin-bottom:8px}p{font-size:14px;color:#9aa0a6;line-height:1.7}
+a{color:#8ab4f8}</style></head><body>
+<div class="card"><h1>CV Studio — login server</h1>
+<p>This server handles sign-in and account approvals for the CV Studio app.</p>
+<p>• <a href="/admin">Admin approval page</a> (needs your ADMIN_KEY)<br>
+• App users sign in inside CV Studio, not here.</p>
+<p>Status: running ✓</p></div></body></html>"""
+
+
 # ---------- admin ----------
 ADMIN_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
