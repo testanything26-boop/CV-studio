@@ -215,8 +215,11 @@ td,th{padding:8px;border-bottom:1px solid #2c3138;text-align:left}
 <h1>CV Studio — Admin</h1>
 <div class="card" id="login">
   <h2>Enter admin key</h2>
-  <input type="password" id="key" placeholder="ADMIN_KEY from Render dashboard">
+  <input type="password" id="key" placeholder="ADMIN_KEY from Render dashboard"
+         onkeydown="if(event.key==='Enter')go()">
   <div style="margin-top:10px"><button onclick="go()">Open</button></div>
+  <div id="keymsg" style="color:#f28b82;font-size:13px;margin-top:8px"></div>
+  <div style="color:#5f6368;font-size:11px;margin-top:14px">build 2026-10-11c — if you don't see this line, the new file hasn't deployed yet</div>
 </div>
 <div id="panel">
   <div class="card"><div class="tabs">
@@ -227,20 +230,44 @@ td,th{padding:8px;border-bottom:1px solid #2c3138;text-align:left}
 </div>
 <script>
 let KEY='';
-function go(){KEY=document.getElementById('key').value;
- document.getElementById('login').style.display='none';
- document.getElementById('panel').style.display='block';load('pending');}
-async function api(p,opt){const r=await fetch(p,{...opt,headers:{'X-Admin-Key':KEY,
- ...(opt&&opt.headers||{})}});return r.json();}
-async function load(f){const d=await api('/admin/api/users?f='+f);
- document.getElementById('list').innerHTML='<table><tr><th>Name</th><th>Email</th>'+
- '<th>Status</th><th></th></tr>'+d.users.map(u=>'<tr><td>'+u.name+'</td><td>'+u.email+
- '</td><td class="st-'+u.status+'">'+u.status+'</td><td>'+
- (u.status==='pending'?'<button onclick="act('+u.id+',\'approve\')">Approve</button>'+
- '<button class="red" onclick="act('+u.id+',\'reject\')">Reject</button>':'')+
- (u.status==='approved'?'<button class="red" onclick="act('+u.id+',\'disable\')">Disable</button>':'')+
- '</td></tr>').join('')+'</table>';}
-async function act(id,a){await api('/admin/api/users/'+id+'/'+a,{method:'POST'});load('pending');}
+async function api(p,opt){
+  const r=await fetch(p,{...opt,headers:{'X-Admin-Key':KEY,...(opt&&opt.headers||{})}});
+  const d=await r.json();
+  if(!r.ok) throw new Error(d.detail||('Error '+r.status));
+  return d;
+}
+async function go(){
+  KEY=document.getElementById('key').value;
+  document.getElementById('keymsg').textContent='';
+  if(!KEY){document.getElementById('keymsg').textContent='Type the admin key first.';return;}
+  try{
+    await api('/admin/api/users?f=pending');
+    document.getElementById('login').style.display='none';
+    document.getElementById('panel').style.display='block';
+    load('pending');
+  }catch(e){
+    document.getElementById('keymsg').textContent=e.message+
+      ' — check the ADMIN_KEY value in your Render dashboard (Environment tab).';
+  }
+}
+async function load(f){
+  try{
+    const d=await api('/admin/api/users?f='+f);
+    document.getElementById('list').innerHTML='<table><tr><th>Name</th><th>Email</th>'+
+    '<th>Status</th><th></th></tr>'+d.users.map(u=>'<tr><td>'+u.name+'</td><td>'+u.email+
+    '</td><td class="st-'+u.status+'">'+u.status+'</td><td>'+
+    (u.status==='pending'?'<button onclick="act('+u.id+',\'approve\')">Approve</button>'+
+    '<button class="red" onclick="act('+u.id+',\'reject\')">Reject</button>':'')+
+    (u.status==='approved'?'<button class="red" onclick="act('+u.id+',\'disable\')">Disable</button>':'')+
+    '</td></tr>').join('')+'</table>';
+  }catch(e){
+    document.getElementById('list').innerHTML='<p style="color:#f28b82">'+e.message+'</p>';
+  }
+}
+async function act(id,a){
+  try{ await api('/admin/api/users/'+id+'/'+a,{method:'POST'});load('pending'); }
+  catch(e){ alert(e.message); }
+}
 </script></body></html>"""
 
 
