@@ -11,7 +11,7 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, Field, field_validator
 
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
@@ -105,15 +105,32 @@ def throttle_clear(ip: str):
     c.close()
 
 
+def _check_email(v: str) -> str:
+    v = v.strip().lower()
+    if "@" not in v or "." not in v.rsplit("@", 1)[-1] or len(v) < 5:
+        raise ValueError("Enter a valid email address.")
+    return v
+
+
 class Register(BaseModel):
     name: str = Field(min_length=1, max_length=80)
-    email: EmailStr
+    email: str = Field(min_length=3, max_length=120)
     password: str = Field(min_length=8, max_length=128)
+
+    @field_validator("email")
+    @classmethod
+    def _email_ok(cls, v):
+        return _check_email(v)
 
 
 class Login(BaseModel):
-    email: EmailStr
+    email: str = Field(min_length=3, max_length=120)
     password: str = Field(min_length=1, max_length=128)
+
+    @field_validator("email")
+    @classmethod
+    def _email_ok(cls, v):
+        return _check_email(v)
 
 
 @app.get("/api/health")
