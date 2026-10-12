@@ -1,5 +1,9 @@
-"""CV Studio auth backend — FastAPI + SQLite. Run: uvicorn main:app --host 0.0.0.0 --port $PORT
-Env: ADMIN_KEY (required for /admin). Data dir: ./data/app.db
+"""CV Studio auth backend — FastAPI + SQLite/Turso. Run: uvicorn main:app --host 0.0.0.0 --port $PORT
+Env: ADMIN_KEY (required for /admin).
+     TURSO_URL + TURSO_TOKEN (optional): when set, accounts live in a free Turso
+         cloud database and SURVIVE Render restarts/redeploys.
+     Without them, data goes to ./data/app.db on the container disk, which
+     Render's free plan WIPES on every restart/redeploy.
 """
 import hashlib
 import hmac
@@ -13,16 +17,67 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
+try:
+    import libsql_experimental as libsql
+    HAVE_LIBSQL = True
+except ImportError:
+    libsql = None
+    HAVE_LIBSQL = False
+
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
+TURSO_URL = os.environ.get("TURSO_URL", "").strip()
+TURSO_TOKEN = os.environ.get("TURSO_TOKEN", "").strip()
+
 DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB = DATA_DIR / "app.db"
-BUILD = "2026-10-11d"
+BUILD = "2026-10-12"
+
+if TURSO_URL and TURSO_TOKEN and HAVE_LIBSQL:
+    STORAGE = "turso"
+else:
+    if (TURSO_URL or TURSO_TOKEN) and not HAVE_LIBSQL:
+        print("WARNING: TURSO_URL/TURSO_TOKEN set but libsql client not installed; "
+              "using local SQLite (data will NOT persist on Render).")
+    STORAGE = "sqlite-local"
 
 app = FastAPI(title="CV Studio Auth")
 
 
+class _LibsqlCursor:
+    """Wraps a libsql cursor so rows come back as dicts like sqlite3.Row."""
+    def __init__(self, cur):
+        self._cur = cur
+        self._cols = [d[0] for d in cur.description] if cur.description else []
+
+    def _conv(self, r):
+        return dict(zip(self._cols, tuple(r))) if self._cols else r
+
+    def fetchone(self):
+        r = self._cur.fetchone()
+        return None if r is None else self._conv(r)
+
+    def fetchall(self):
+        return [self._conv(r) for r in self._cur.fetchall()]
+
+
+class _LibsqlConn:
+    def __init__(self, raw):
+        self._raw = raw
+
+    def execute(self, sql, args=()):
+        return _LibsqlCursor(self._raw.execute(sql, args))
+
+    def commit(self):
+        self._raw.commit()
+
+    def close(self):
+        self._raw.close()
+
+
 def db():
+    if STORAGE == "turso":
+        return _LibsqlConn(libsql.connect(TURSO_URL, auth_token=TURSO_TOKEN))
     c = sqlite3.connect(DB)
     c.row_factory = sqlite3.Row
     return c
@@ -135,7 +190,7 @@ class Login(BaseModel):
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "build": BUILD}
+    return {"ok": True, "build": BUILD, "storage": STORAGE}
 
 
 @app.post("/api/register")
@@ -276,7 +331,7 @@ td,th{padding:8px;border-bottom:1px solid #2c3138;text-align:left}
          onkeydown="if(event.key==='Enter')go()">
   <div style="margin-top:10px"><button onclick="go()">Open</button></div>
   <div id="keymsg"></div>
-  <div class="build">build __BUILD__ - if you do not see this line, the new file has not deployed yet</div>
+  <div class="build">build __BUILD__ · storage: __STORAGE__ - if you do not see this line, the new file has not deployed yet</div>
 </div>
 <div id="panel" class="card" style="display:none">
   <h2>Account approvals</h2>
@@ -339,7 +394,7 @@ async function act(id,a){
 }
 </script>
 </body></html>
-""".replace("__BUILD__", BUILD)
+""".replace("__BUILD__", BUILD).replace("__STORAGE__", STORAGE)
 
 
 @app.get("/admin", response_class=HTMLResponse)
